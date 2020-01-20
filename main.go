@@ -53,32 +53,49 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 	})
 }
 
+type storyCache struct {
+	Items      []item
+	Expiration time.Time
+	sync.Mutex
+}
+
+func (c *storyCache) Empty() bool {
+	return len(c.Items) == 0
+}
+
+func (c *storyCache) Clear() {
+	c.Items = []item{}
+}
+
+// Global
 var cache storyCache
 
 func getStories() ([]item, error) {
 	cache.Lock()
 	defer cache.Unlock()
 
-	var out []item
 	var client hn.Client
 
 	ids, err := client.TopItems()
 	if err != nil {
-		return out, errors.New("something went wrong")
+		return nil, errors.New("something went wrong")
 	}
+
 	done := make(chan interface{})
 	defer close(done)
 
-	if !cache.Empty() && time.Now().Sub(cache.Expiration) > 0 {
+	if !cache.Empty() && time.Now().Sub(cache.Expiration) < 0 {
+		fmt.Println("returning cached stories")
 		return cache.Items, nil
 	}
 
-	for item := range take(done, getItems(done, ids, client), 30) {
-		out = append(out, item)
+	cache.Clear()
+	for result := range take(done, getItems(done, ids, client), 30) {
+		cache.Items = append(cache.Items, result.item)
 	}
-	cache.Items = out
-	cache.Expiration = time.Now().Add(time.Second * 30)
+	cache.Expiration = time.Now().Add(time.Second * 3)
 
+	// Currently not really working?
 	fmt.Println("sorting stories")
 	sort.Slice(cache.Items, func(i, j int) bool {
 		return cache.Items[i].ID > cache.Items[j].ID
@@ -87,9 +104,14 @@ func getStories() ([]item, error) {
 	return cache.Items, nil
 }
 
-func getItems(done <-chan interface{}, ids []int, client hn.Client) <-chan item {
+type result struct {
+	index int
+	item  item
+}
+
+func getItems(done <-chan interface{}, ids []int, client hn.Client) <-chan result {
 	var wg sync.WaitGroup
-	iwStream := make(chan item)
+	iwStream := make(chan result)
 
 	for _, id := range ids {
 		wg.Add(1)
@@ -106,8 +128,7 @@ func getItems(done <-chan interface{}, ids []int, client hn.Client) <-chan item 
 			}
 			item := parseHNItem(hnItem)
 			if isStoryLink(item) {
-				// fmt.Printf("received story %v", item)
-				iwStream <- item
+				iwStream <- result{index: i, item: item}
 			}
 			wg.Done()
 		}(id)
@@ -122,8 +143,8 @@ func getItems(done <-chan interface{}, ids []int, client hn.Client) <-chan item 
 	return iwStream
 }
 
-func take(done <-chan interface{}, valueStream <-chan item, count int) <-chan item {
-	takeStream := make(chan item, count)
+func take(done <-chan interface{}, valueStream <-chan result, count int) <-chan result {
+	takeStream := make(chan result)
 	go func() {
 		defer close(takeStream)
 		for i := count; i > 0 || i == -1; {
@@ -146,14 +167,6 @@ func isStoryLink(item item) bool {
 	return item.Type == "story" && item.URL != ""
 }
 
-type itemFilter func(item item) bool
-
-func isStoryLinkFunc() itemFilter {
-	return func(it item) bool {
-		return it.Type == "story" && it.URL != ""
-	}
-}
-
 func parseHNItem(hnItem hn.Item) item {
 	ret := item{Item: hnItem}
 	url, err := url.Parse(ret.URL)
@@ -173,28 +186,3 @@ type templateData struct {
 	Stories []item
 	Time    time.Duration
 }
-
-type storyCache struct {
-	Items      []item
-	Expiration time.Time
-	sync.Mutex
-}
-
-func (c storyCache) Empty() bool {
-	return len(c.Items) == 0
-}
-
-// var stories []item
-// for _, id := range ids {
-// 	hnItem, err := client.GetItem(id)
-// 	if err != nil {
-// 		continue
-// 	}
-// 	item := parseHNItem(hnItem)
-// 	if isStoryLink(item) {
-// 		stories = append(stories, item)
-// 		if len(stories) >= numStories {
-// 			break
-// 		}
-// 	}
-// }
